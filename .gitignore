@@ -1,0 +1,28 @@
+# Entornos virtuales
+venv/
+.venv/
+env/
+
+# Variables de entorno y secretos
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Logs
+logs/
+*.log
+
+# Archivos locales
+.DS_Store
+.vscode/
+.idea/
+.flows.json.backup
+piper-voices/*.onnx
+otros/receptor.ino

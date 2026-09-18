@@ -1,0 +1,804 @@
+"""
+Bot de Telegram para el huerto de Fundautonoma.
+
+MVP (fase lean): recibe mensajes de texto, los envía al LLM local
+(servidor OpenAI-compatible de LM Studio, con Qwen3.5-4B ya elegido tras
+la evaluación con usuarios) y responde en español, con el tono definido
+para cuidadores sin conocimientos técnicos.
+
+Principios de Karpathy aplicados:
+- Simplicity First: sin frameworks de agentes (LangChain/CrewAI/Hermes),
+  solo Telegram + una llamada HTTP al LLM.
+- Surgical Changes: un solo archivo, una función por responsabilidad.
+- Goal-Driven: el criterio de éxito es "el cuidador recibe una respuesta
+  clara y correcta en <20s", no una receta paso a paso.
+
+Fase 2 (esta versión ya incluye voz; sigue pendiente):
+- Conexión con los datos reales del riego (Node-RED / MongoDB) para que
+  el LLM narre datos verdaderos en vez de lo que el usuario escriba.
+- Posible migración a Hermes Agent si este MVP se queda corto.
+
+Voz (nuevo en esta versión):
+- Entrada: notas de voz de Telegram (.ogg/Opus) -> faster-whisper -> texto.
+- Salida: respuesta del LLM -> Piper -> WAV -> ffmpeg -> .ogg/Opus -> Telegram.
+- Si el usuario escribe texto, se responde con texto (comportamiento sin cambios).
+- Si el usuario manda voz, se responde con voz (con texto como respaldo si
+  la síntesis falla).
+
+Fix aplicado (2026-08-24):
+- ask_llm() enviaba 3 mensajes "system" consecutivos (prompt + telemetría +
+  resumen histórico). La plantilla Jinja de Qwen3.5 en LM Studio exige que,
+  si hay un mensaje system, sea único y esté en la posición 0; cualquier
+  otro system después del primero dispara la excepción de la plantilla
+  ("System message must be at the beginning") y LM Studio responde 400.
+  Se fusionaron los tres bloques en un solo mensaje system. No afecta el
+  historial de conversación (_history solo guarda turnos user/assistant).
+- Se desactivó el "thinking mode" de Qwen3.5 (enable_thinking=False) y se
+  agregó un respaldo si el modelo devuelve contenido vacío de todas formas
+  (nunca se manda texto vacío a Telegram).
+
+Fase 3 (2026-08-24): detección determinista de acciones (Karpathy: Surgical
++ Goal-Driven). Corre ANTES del LLM. Su única función hoy es reconocer que
+el usuario pidió una acción física y responder honestamente que todavía no
+se puede ejecutar — NO publica nada a MQTT/Node-RED (esa superficie no se
+abre hasta que se retome esa parte del sistema). El punto de conexión
+futuro del patrón launch+ack queda marcado explícitamente en
+responder_accion_no_disponible().
+
+Decisión 5 (2026-09-02): resolutor determinista de consultas informativas
+(Cap. 8). Corre después de la detección de acciones y antes del LLM.
+Cubre tiempo de riego/activaciones de hoy, humedad promedio histórica, y
+estado actual (válvulas/bomba/CAN) — ver docstring de
+resolver_consulta_determinista() para el detalle exacto de cobertura.
+
+También se agregó "/no_think" al turno enviado al LLM en ask_llm(), como
+segunda capa contra el thinking mode de Qwen3.5 (el flag enable_thinking
+vía extra_body no se estaba respetando en el 100% de las llamadas).
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import unicodedata
+import wave
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Deque, Dict
+
+from faster_whisper import WhisperModel
+from openai import OpenAI
+from piper import PiperVoice
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# --------------------------------------------------------------------------
+# Configuración (todo por variables de entorno; ver .env.example)
+# --------------------------------------------------------------------------
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]  # obligatorio, sin default
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:1234/v1")
+LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.5-4b")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "lm-studio")  # LM Studio ignora el valor
+MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", "4"))
+REQUEST_TIMEOUT_S = int(os.environ.get("REQUEST_TIMEOUT_S", "60"))
+
+# --------------------------------------------------------------------------
+# Configuración de voz (STT: faster-whisper / TTS: Piper)
+# --------------------------------------------------------------------------
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")
+WHISPER_COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")  # int8 = rápido en CPU
+WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "es")
+
+# Vocabulario del dominio para sesgar la transcripción (bitácora de
+# transferencia motor->huerto, patrón 6): ayuda a Whisper con términos
+# técnicos ambiguos o poco frecuentes en español general.
+WHISPER_INITIAL_PROMPT = (
+    "Vocabulario del huerto: zona uno, zona dos, zona tres, válvula, "
+    "válvulas, riego, bomba, humedad, sensor, conexión CAN, modo manual, "
+    "modo automático."
+)
+
+# Ruta al modelo .onnx de Piper (el .onnx.json debe estar en la misma carpeta).
+# Se descarga aparte con: python -m piper.download_voices <nombre_voz>
+PIPER_VOICE_PATH = os.environ.get("PIPER_VOICE_PATH", "")
+
+# --------------------------------------------------------------------------
+# Configuración de MongoDB (telemetría real del huerto, de la Opción A)
+# --------------------------------------------------------------------------
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+MONGO_DB = os.environ.get("MONGO_DB", "huerto")
+MONGO_COLLECTION = os.environ.get("MONGO_COLLECTION", "telemetria")
+EVENTOS_COLLECTION = os.environ.get("EVENTOS_COLLECTION", "eventos")
+# Ventana de tiempo que cubre el "resumen histórico" (tiempo de riego,
+# humedad promedio). 24h = rolling window, no "calendario" (más simple).
+HISTORIAL_HORAS = int(os.environ.get("HISTORIAL_HORAS", "24"))
+# Si el dato más reciente es más viejo que esto, se avisa al LLM que está
+# desactualizado en vez de presentarlo como si fuera en vivo.
+TELEMETRY_STALE_MINUTES = int(os.environ.get("TELEMETRY_STALE_MINUTES", "60"))
+
+# Prompt validado en las pruebas a ciegas con Qwen3.5-4B (ver reporte de evaluación)
+SYSTEM_PROMPT = (
+    "Eres el asistente del huerto de Fundautonoma. Respondes siempre en "
+    "español colombiano, de forma clara y amable, como si hablaras con un "
+    "adulto mayor sin conocimientos técnicos. Máximo 3 oraciones. "
+    "No inventes datos que no te den; si no tienes información suficiente, dilo. "
+    "Recibirás dos bloques de datos: el estado ACTUAL de los sensores, y un "
+    "RESUMEN de las últimas horas (tiempo de riego, promedios). Usa cada uno "
+    "según corresponda a la pregunta (ahora vs. historial/hoy), y solo si la "
+    "pregunta es sobre el huerto; si pregunta otra cosa, ignora ambos."
+)
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("huerto-bot")
+
+llm_client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+
+if shutil.which("ffmpeg") is None:
+    log.warning(
+        "ffmpeg no está instalado (sudo apt install ffmpeg): las respuestas "
+        "de voz no se podrán convertir al formato que exige Telegram."
+    )
+
+# Los modelos de voz se cargan de forma perezosa (solo la primera vez que se
+# reciba una nota de voz), no al arrancar. Así:
+#  1) el bot sigue arrancando rápido si todavía no se usa voz,
+#  2) el modo texto (ya validado en producción) no depende de ellos,
+#  3) no se descarga ~500MB de Whisper si nunca llega un audio.
+_whisper_model: WhisperModel | None = None
+_piper_voice: PiperVoice | None = None
+
+
+def get_whisper_model() -> WhisperModel:
+    global _whisper_model
+    if _whisper_model is None:
+        log.info("Cargando modelo de voz a texto (faster-whisper, %s)...", WHISPER_MODEL_SIZE)
+        _whisper_model = WhisperModel(
+            WHISPER_MODEL_SIZE, device="cpu", compute_type=WHISPER_COMPUTE_TYPE
+        )
+    return _whisper_model
+
+
+def get_piper_voice() -> PiperVoice:
+    global _piper_voice
+    if _piper_voice is None:
+        if not PIPER_VOICE_PATH:
+            raise RuntimeError("PIPER_VOICE_PATH no está configurado en .env")
+        log.info("Cargando voz de Piper desde %s...", PIPER_VOICE_PATH)
+        _piper_voice = PiperVoice.load(PIPER_VOICE_PATH)
+    return _piper_voice
+
+
+_mongo_client: MongoClient | None = None
+
+
+def get_mongo_client() -> MongoClient:
+    global _mongo_client
+    if _mongo_client is None:
+        # Timeout corto: si Mongo no responde, el bot no debe quedarse
+        # colgado esperando — mejor seguir sin datos que trabar la respuesta.
+        _mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
+    return _mongo_client
+
+# Historial corto por chat (en memoria; se pierde al reiniciar el bot).
+# Suficiente para dar continuidad a la conversación sin añadir una base de
+# datos todavía: eso se conecta después con MongoDB (Opción A pendiente).
+_history: Dict[int, Deque[dict]] = defaultdict(
+    lambda: deque(maxlen=MAX_HISTORY_TURNS * 2)
+)
+
+
+def get_latest_telemetry() -> dict | None:
+    """Consulta el documento más reciente de telemetria. Devuelve None si
+    Mongo no responde o si la colección está vacía (nunca debe romper el bot).
+    """
+    try:
+        client = get_mongo_client()
+        return client[MONGO_DB][MONGO_COLLECTION].find_one(sort=[("timestamp", -1)])
+    except PyMongoError as e:
+        log.warning("No se pudo leer telemetria de MongoDB: %s", e)
+        return None
+
+
+def format_telemetry_for_llm(doc: dict | None) -> str:
+    """Convierte el documento crudo de Mongo en una descripción en texto que
+    el LLM pueda usar de contexto (no se le manda el JSON crudo)."""
+    if doc is None:
+        return "No hay datos de sensores disponibles en este momento."
+
+    edad_minutos = (datetime.now(timezone.utc) - doc["timestamp"].replace(tzinfo=timezone.utc)) \
+        .total_seconds() / 60
+
+    def estado_can(v) -> str:
+        return "en línea" if v == 1 else "sin conexión"
+
+    partes = [
+        f"Hace {edad_minutos:.0f} minutos:",
+        f"zona 1 humedad {doc.get('zona1_humedad')}%,",
+        f"zona 2 humedad {doc.get('zona2_humedad')}%,",
+        f"zona 3 humedad {doc.get('zona3_humedad')}%,",
+        f"temperatura {doc.get('temp_ambiente')}°C,",
+        f"humedad ambiente {doc.get('hum_ambiente')}%,",
+        f"bomba de agua (motor principal) {'encendida' if doc.get('bomba') == 1 else 'apagada'},",
+        f"válvula zona 1 {'abierta' if doc.get('valvula1') == 1 else 'cerrada'},",
+        f"válvula zona 2 {'abierta' if doc.get('valvula2') == 1 else 'cerrada'},",
+        f"válvula zona 3 {'abierta' if doc.get('valvula3') == 1 else 'cerrada'}.",
+        "(la bomba y las válvulas son componentes distintos, no los confundas)",
+        f"Conexión CAN zona 1: {estado_can(doc.get('can1_online'))},",
+        f"conexión CAN zona 2: {estado_can(doc.get('can2_online'))},",
+        f"conexión CAN zona 3: {estado_can(doc.get('can3_online'))}.",
+    ]
+    if edad_minutos > TELEMETRY_STALE_MINUTES:
+        partes.append(
+            f"AVISO: este dato tiene más de {TELEMETRY_STALE_MINUTES} minutos, "
+            "podría estar desactualizado."
+        )
+
+    return " ".join(partes)
+
+
+def _calcular_tiempo_riego(eventos: list[dict]) -> tuple[float, int]:
+    """Reproduce la misma lógica que el nodo 'tiempo riego' de Node-RED, pero
+    en Python sobre la colección eventos (en vez de inferirlo de sensores).
+
+    Empareja cada riego_on con el riego_off que le sigue y suma duraciones.
+    Si el último evento es un riego_on sin su riego_off correspondiente
+    (todavía regando ahora mismo), cuenta desde ahí hasta el momento actual.
+    """
+    inicio_riego = None
+    total_segundos = 0.0
+    activaciones = 0
+
+    for ev in eventos:
+        if ev["tipo"] == "riego_on":
+            inicio_riego = ev["timestamp"]
+            activaciones += 1
+        elif ev["tipo"] == "riego_off" and inicio_riego is not None:
+            total_segundos += (ev["timestamp"] - inicio_riego).total_seconds()
+            inicio_riego = None
+
+    if inicio_riego is not None:
+        ahora = datetime.now(timezone.utc)
+        total_segundos += (ahora - inicio_riego.replace(tzinfo=timezone.utc)).total_seconds()
+
+    return total_segundos / 60, activaciones
+
+
+def get_daily_summary() -> dict | None:
+    """Consulta un resumen de las últimas HISTORIAL_HORAS: humedad promedio
+    por zona (de telemetria) y tiempo total de riego (de eventos).
+    Devuelve None si Mongo no responde o no hay datos en esa ventana.
+    """
+    try:
+        client = get_mongo_client()
+        desde = datetime.now(timezone.utc) - timedelta(hours=HISTORIAL_HORAS)
+
+        pipeline = [
+            {"$match": {"timestamp": {"$gte": desde}}},
+            {"$group": {
+                "_id": None,
+                "zona1_prom": {"$avg": "$zona1_humedad"},
+                "zona2_prom": {"$avg": "$zona2_humedad"},
+                "zona3_prom": {"$avg": "$zona3_humedad"},
+                "n": {"$sum": 1},
+            }},
+        ]
+        resultado = list(client[MONGO_DB][MONGO_COLLECTION].aggregate(pipeline))
+        promedios = resultado[0] if resultado else None
+
+        eventos = list(
+            client[MONGO_DB][EVENTOS_COLLECTION]
+            .find({"timestamp": {"$gte": desde}})
+            .sort("timestamp", 1)
+        )
+        minutos_riego, activaciones = _calcular_tiempo_riego(eventos)
+
+        if promedios is None and not eventos:
+            return None
+
+        return {"promedios": promedios, "minutos_riego": minutos_riego, "activaciones": activaciones}
+    except PyMongoError as e:
+        log.warning("No se pudo leer resumen histórico de MongoDB: %s", e)
+        return None
+
+
+def format_daily_summary_for_llm(resumen: dict | None) -> str:
+    """Convierte el resumen histórico en texto para el contexto del LLM."""
+    if resumen is None:
+        return f"No hay historial de las últimas {HISTORIAL_HORAS} horas disponible."
+
+    partes = [
+        f"Resumen de las últimas {HISTORIAL_HORAS} horas: se regó un total de "
+        f"{resumen['minutos_riego']:.0f} minutos, en {resumen['activaciones']} activación(es)."
+    ]
+
+    prom = resumen.get("promedios")
+    if prom:
+        partes.append(
+            f"Humedad promedio: zona 1 {prom['zona1_prom']:.0f}%, "
+            f"zona 2 {prom['zona2_prom']:.0f}%, zona 3 {prom['zona3_prom']:.0f}%."
+        )
+
+    return " ".join(partes)
+
+
+# --------------------------------------------------------------------------
+# Detección determinista de acciones (Fase 3)
+#
+# Corre ANTES del LLM. Reconoce que el usuario pidió una acción física
+# (abrir/cerrar válvula, encender/apagar bomba, cambiar de modo) y responde
+# honestamente que todavía no se puede ejecutar — sin tocar MQTT/Node-RED.
+#
+# Justificación de diseño (evaluada contra la arquitectura de ai.pdf, el
+# paper de microservicios CIP): el paper separa un "Deterministic
+# Supervisor" — el único componente con ruta de escritura validada hacia el
+# actuador — de un LLM Assistant puramente consultivo, sin autoridad de
+# escritura. Esa propiedad de seguridad es verificable inspeccionando el
+# grafo de componentes, no depende de que el modelo "decida bien". Aquí se
+# aplica la misma idea a nivel embrionario: detectar_accion() /
+# responder_accion_no_disponible() son el único código que reconoce una
+# intención de acción, y ninguno de los dos importa un cliente MQTT ni
+# conoce Node-RED — esa ruta de escritura no existe todavía en el grafo del
+# sistema, a propósito, no por instrucción al modelo.
+#
+# Limitación conocida (a refinar con frases reales de las pruebas con la
+# comunidad, ver bitácora motor->huerto, punto "colisión de palabras
+# clave"): _extraer_zona() busca el primer número (dígito o en palabras) en
+# todo el mensaje, no solo cerca de "válvula". Si el mensaje real usa un
+# número por otro motivo en la misma frase, podría capturarlo mal. Bajo
+# riesgo hoy porque no hay más detectores deterministas con los que
+# colisionar, pero vale la pena una lista de pruebas cruzadas antes de
+# confiar en esto para acciones reales.
+# --------------------------------------------------------------------------
+
+_ZONA_PALABRAS = {
+    "1": "1", "uno": "1", "una": "1", "primera": "1",
+    "2": "2", "dos": "2", "segunda": "2",
+    "3": "3", "tres": "3", "tercera": "3",
+}
+
+_MODOS_VALIDOS = {
+    "manual": "manual",
+    "automatico": "automático",
+    "auto": "automático",
+    "ia": "ia",
+    "inteligente": "ia",
+}
+
+_ABRIR_VALVULA = re.compile(r"\babr(?:e|ir|iste|amos)?\b.*\bvalvula")
+_CERRAR_VALVULA = re.compile(r"\b(?:cierr(?:a|e|as)?|cerrar)\b.*\bvalvula")
+_ENCENDER_BOMBA = re.compile(r"\b(?:encien(?:de|da)?|prende|activa)\b.*\bbomba")
+_APAGAR_BOMBA = re.compile(r"\b(?:apaga|desactiva)\b.*\bbomba")
+_CAMBIAR_MODO = re.compile(r"\b(?:cambia|cambiar|pon|poner)\b.*\bmodo")
+
+
+def _normalizar(texto: str) -> str:
+    """minúsculas y sin tildes, para que la detección no dependa de cómo
+    escriba el usuario o de cómo Whisper transcriba los acentos."""
+    sin_tildes = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
+    return sin_tildes.lower().strip()
+
+
+def _extraer_zona(texto_normalizado: str) -> str | None:
+    m = re.search(r"\b(1|2|3|uno|una|primera|dos|segunda|tres|tercera)\b", texto_normalizado)
+    return _ZONA_PALABRAS.get(m.group(1)) if m else None
+
+
+def _extraer_modo(texto_normalizado: str) -> str | None:
+    for palabra, modo in _MODOS_VALIDOS.items():
+        if re.search(rf"\b{palabra}\b", texto_normalizado):
+            return modo
+    return None
+
+
+def detectar_accion(texto_usuario: str) -> dict | None:
+    """Devuelve un dict describiendo la acción detectada, o None si el
+    mensaje no corresponde a ninguna acción reconocida (en ese caso sigue
+    el flujo normal hacia ask_llm())."""
+    texto = _normalizar(texto_usuario)
+
+    if _ABRIR_VALVULA.search(texto):
+        return {"tipo": "abrir_valvula", "zona": _extraer_zona(texto)}
+    if _CERRAR_VALVULA.search(texto):
+        return {"tipo": "cerrar_valvula", "zona": _extraer_zona(texto)}
+    if _ENCENDER_BOMBA.search(texto):
+        return {"tipo": "encender_bomba"}
+    if _APAGAR_BOMBA.search(texto):
+        return {"tipo": "apagar_bomba"}
+    if _CAMBIAR_MODO.search(texto):
+        return {"tipo": "cambiar_modo", "modo": _extraer_modo(texto)}
+
+    return None
+
+
+def _describir_accion(accion: dict) -> str:
+    tipo = accion["tipo"]
+    if tipo == "abrir_valvula":
+        zona = accion.get("zona")
+        return f"abrir la válvula de la zona {zona}" if zona else "abrir esa válvula"
+    if tipo == "cerrar_valvula":
+        zona = accion.get("zona")
+        return f"cerrar la válvula de la zona {zona}" if zona else "cerrar esa válvula"
+    if tipo == "encender_bomba":
+        return "encender la bomba"
+    if tipo == "apagar_bomba":
+        return "apagar la bomba"
+    if tipo == "cambiar_modo":
+        modo = accion.get("modo")
+        return f"cambiar el huerto a modo {modo}" if modo else "cambiar el modo del huerto"
+    return "hacer ese cambio"
+
+
+def responder_accion_no_disponible(accion: dict) -> str:
+    """Respuesta honesta para una acción detectada. NO publica nada a
+    MQTT/Node-RED todavía — a propósito.
+
+    Punto de conexión futuro (patrón launch + ack, ver bitácora de
+    transferencia motor->huerto): cuando se retome Node-RED, esta función
+    es el lugar exacto a reemplazar por:
+      1) publicar la intención (ej. tópico riego/...), igual que ya hace
+         hoy el canal manual del dashboard;
+      2) esperar confirmación real (telemetría reflejando el nuevo estado,
+         o un evento explícito) con timeout;
+      3) solo entonces devolver un mensaje de éxito — nunca antes, para no
+         repetir el bug de motor donde el LLM decía "listo" sin que hubiera
+         pasado nada.
+    Mientras el punto 2 no exista, esta función debe seguir devolviendo el
+    mensaje honesto de abajo, y este archivo no debe importar ningún
+    cliente MQTT.
+    """
+    descripcion = _describir_accion(accion)
+    return (
+        f"Por ahora todavía no puedo {descripcion} por ti — esa parte "
+        "está en construcción. Mientras tanto, alguien puede hacerlo "
+        "directamente desde el tablero del huerto."
+    )
+
+
+# --------------------------------------------------------------------------
+# Resolutor determinista de consultas informativas (Decisión 5, Cap. 8)
+#
+# Corre DESPUÉS de detectar_accion() y ANTES de ask_llm(). Patrón "fallback
+# determinista" de ai.pdf (RAG industrial, Reto 3): si la pregunta admite
+# una respuesta exacta calculable sobre datos ya en Mongo, se responde por
+# consulta directa y el LLM NO se invoca en absoluto. Alucinación
+# matemáticamente imposible en estas respuestas: no hay generación de
+# lenguaje de por medio, solo aritmética sobre datos reales.
+#
+# Reutiliza get_daily_summary()/get_latest_telemetry() y sus formateadores
+# ya existentes — no duplica lógica de agregación. Cubre tres patrones;
+# todo lo demás sigue yendo al LLM (ver docstring de
+# resolver_consulta_determinista para el detalle de qué queda fuera).
+# --------------------------------------------------------------------------
+
+_FORMAS_RIEGO = ("riego", "regando", "regado", "regada", "rego", "regaron", "regue")
+_CUES_RIEGO_HOY = re.compile(
+    r"\b(hoy|cuanto|cuanta|cuantos|cuantas|total|veces|activaciones|minutos|horas)\b"
+)
+
+_CUES_HUMEDAD_PROMEDIO = re.compile(r"\b(promedio|hoy|ha estado|han estado)\b")
+
+_FRASES_ESTADO_ACTUAL = (
+    "estado actual", "estado del huerto", "como esta el huerto",
+    "que tal el huerto", "esta el huerto", "conexion can",
+)
+_PALABRAS_ESTADO_ACTUAL = re.compile(
+    r"\b(can|valvula|bomba|regando|prendida|apagada|encendida|abierta|cerrada)\b"
+)
+
+
+def _es_pregunta_riego_hoy(texto: str) -> bool:
+    tiene_riego = any(forma in texto for forma in _FORMAS_RIEGO)
+    return tiene_riego and bool(_CUES_RIEGO_HOY.search(texto))
+
+
+def _es_pregunta_humedad_promedio(texto: str) -> bool:
+    return "humedad" in texto and bool(_CUES_HUMEDAD_PROMEDIO.search(texto))
+
+
+def _es_pregunta_estado_actual(texto: str) -> bool:
+    if any(frase in texto for frase in _FRASES_ESTADO_ACTUAL):
+        return True
+    return bool(_PALABRAS_ESTADO_ACTUAL.search(texto))
+
+
+def resolver_consulta_determinista(user_text: str) -> str | None:
+    """Resuelve por consulta directa a MongoDB (sin LLM) las preguntas
+    informativas que ya tienen una respuesta exacta calculable.
+
+    Devuelve la respuesta ya lista para enviar, o None si el mensaje no
+    coincide con ninguno de los tres patrones cubiertos (en ese caso el
+    flujo sigue normal hacia ask_llm()).
+
+    Cubre:
+      1) Tiempo de riego / activaciones de hoy (ej. "¿cuánto ha regado
+         hoy?", "qué ha pasado hoy en cuanto al riego").
+      2) Humedad promedio por zona, histórica (ej. "humedad promedio",
+         "¿cómo ha estado la humedad?").
+      3) Estado actual del huerto: válvulas, bomba, conexión CAN (ej.
+         "estado actual", "¿la bomba está encendida?", "¿alguna válvula
+         está abierta?", "¿está regando ahora?").
+
+    NO cubre (sigue yendo al LLM):
+      - Humedad de una zona AHORA MISMO sin "hoy"/"promedio"/"ha estado"
+        (ej. "dime la humedad de todas las zonas") — el patrón 2 de la
+        Decisión 5 es sobre el promedio histórico, no la lectura
+        instantánea; no existe función que aísle humedad actual por zona
+        sin reusar/tocar format_telemetry_for_llm en su totalidad.
+      - Preguntas sobre una sola zona en particular (ej. "¿cómo está la
+        zona 1?") — get_latest_telemetry()/format_telemetry_for_llm() no
+        filtran por zona, devuelven el estado completo del huerto.
+      - Cualquier mensaje que combine varios temas o use lenguaje ambiguo
+        que no calce con las frases/palabras clave anteriores.
+    """
+    texto = _normalizar(user_text)
+
+    if _es_pregunta_riego_hoy(texto):
+        return format_daily_summary_for_llm(get_daily_summary())
+
+    if _es_pregunta_humedad_promedio(texto):
+        resumen = get_daily_summary()
+        if resumen is None or not resumen.get("promedios"):
+            return (
+                f"No tengo el promedio de humedad de las últimas "
+                f"{HISTORIAL_HORAS} horas disponible en este momento."
+            )
+        prom = resumen["promedios"]
+        return (
+            f"En las últimas {HISTORIAL_HORAS} horas, la humedad promedio fue: "
+            f"zona 1 {prom['zona1_prom']:.0f}%, zona 2 {prom['zona2_prom']:.0f}%, "
+            f"zona 3 {prom['zona3_prom']:.0f}%."
+        )
+
+    if _es_pregunta_estado_actual(texto):
+        return format_telemetry_for_llm(get_latest_telemetry())
+
+    return None
+
+
+def ask_llm(chat_id: int, user_text: str) -> str:
+    """Envía el mensaje del usuario + historial corto + telemetría actual +
+    resumen histórico al LLM local. El contexto se refresca en cada llamada
+    y NO se guarda en el historial de conversación (para que el siguiente
+    turno vea siempre el dato más nuevo).
+
+    Nota 1: se envía un único mensaje "system" (prompt + telemetría + resumen
+    fusionados), porque la plantilla Jinja de Qwen3.5 en LM Studio exige que,
+    si hay mensaje system, sea único y esté en la posición 0.
+
+    Nota 2: se desactiva el "thinking mode" de Qwen3.5 (enable_thinking=False).
+    Sin esto, el modelo puede gastar todo max_tokens razonando internamente
+    y devolver content vacío (finish_reason="length"), lo que además revienta
+    reply_text() de Telegram (no acepta mensajes vacíos).
+    """
+    telemetry_context = format_telemetry_for_llm(get_latest_telemetry())
+    daily_context = format_daily_summary_for_llm(get_daily_summary())
+
+    messages = [
+        {
+            "role": "system",
+            "content": "\n\n".join([
+                SYSTEM_PROMPT,
+                f"Datos actuales del huerto: {telemetry_context}",
+                daily_context,
+            ]),
+        },
+    ]
+    messages.extend(_history[chat_id])
+    # "/no_think" al final del turno del usuario: segunda capa contra el
+    # thinking mode de Qwen3.5, independiente de chat_template_kwargs.
+    # Se agrega SOLO al mensaje enviado al LLM, nunca a _history ni a lo
+    # que ve el usuario (ver bug real: finish_reason="length" con
+    # reasoning_content lleno y content vacío, incluso con
+    # enable_thinking=False vía extra_body en algunas llamadas).
+    messages.append({"role": "user", "content": f"{user_text}\n\n/no_think"})
+
+    response = llm_client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=messages,
+        temperature=0.7,
+        top_p=0.8,
+        max_tokens=300,
+        timeout=REQUEST_TIMEOUT_S,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    )
+    choice = response.choices[0]
+    reply = (choice.message.content or "").strip()
+
+    if not reply:
+        # Red de seguridad: si el modelo sigue devolviendo vacío (thinking
+        # mode no desactivado por esta build, corte por longitud, etc.),
+        # nunca se manda texto vacío a Telegram.
+        log.warning(
+            "El LLM devolvió contenido vacío (finish_reason=%s); "
+            "revisar si enable_thinking sigue activo en LM Studio.",
+            choice.finish_reason,
+        )
+        reply = (
+            "Uy, no logré terminar de pensar la respuesta. "
+            "¿Puedes preguntarme de nuevo, por favor?"
+        )
+
+    _history[chat_id].append({"role": "user", "content": user_text})
+    _history[chat_id].append({"role": "assistant", "content": reply})
+
+    return reply
+
+
+def process_user_message(chat_id: int, user_text: str) -> str:
+    """Punto único de TRES etapas para cualquier mensaje ya convertido a
+    texto (llega por Telegram como texto, o como nota de voz ya
+    transcrita). handle_text() y handle_voice() llaman ambos aquí, para
+    que el comportamiento no diverja entre canales de entrada.
+
+    Orden (cada etapa solo corre si la anterior no resolvió el mensaje):
+      1) Detección determinista de ACCIONES (Fase 3) — pedidos de
+         escribir hacia un actuador. Nunca llega al LLM.
+      2) Resolutor determinista de CONSULTAS informativas (Decisión 5,
+         Cap. 8) — preguntas con respuesta exacta calculable. Nunca
+         llega al LLM.
+      3) LLM (ask_llm) — todo lo que no coincidió con 1) ni 2).
+
+    Esta función es, en sí misma, el "Deterministic Supervisor" del
+    sistema (ver ai.pdf): el LLM solo se invoca cuando ninguna de las
+    dos etapas deterministas resolvió el mensaje, nunca antes.
+    """
+    accion = detectar_accion(user_text)
+    if accion is not None:
+        log.info("Acción detectada (todavía sin ejecutar): %s | mensaje: %r", accion, user_text)
+        reply = responder_accion_no_disponible(accion)
+        _history[chat_id].append({"role": "user", "content": user_text})
+        _history[chat_id].append({"role": "assistant", "content": reply})
+        return reply
+
+    reply_determinista = resolver_consulta_determinista(user_text)
+    if reply_determinista is not None:
+        log.info("Consulta resuelta sin LLM (Decisión 5) | mensaje: %r", user_text)
+        _history[chat_id].append({"role": "user", "content": user_text})
+        _history[chat_id].append({"role": "assistant", "content": reply_determinista})
+        return reply_determinista
+
+    return ask_llm(chat_id, user_text)
+
+
+def transcribe_audio(audio_path: str) -> str:
+    """Transcribe un archivo de audio (cualquier formato que ffmpeg soporte,
+    incluido el .oga/Opus de las notas de voz de Telegram) a texto en español.
+    Usa WHISPER_INITIAL_PROMPT para sesgar el reconocimiento hacia el
+    vocabulario del huerto (zona, válvula, riego, bomba, etc.).
+    """
+    segments, _info = get_whisper_model().transcribe(
+        audio_path,
+        language=WHISPER_LANGUAGE,
+        beam_size=1,
+        initial_prompt=WHISPER_INITIAL_PROMPT,
+    )
+    # segments es un generador: hay que consumirlo para que se genere el texto.
+    return " ".join(segment.text for segment in segments).strip()
+
+
+def wav_bytes_to_ogg_opus(wav_bytes: bytes) -> bytes:
+    """Convierte WAV a .ogg/Opus, el único formato que Telegram acepta para que
+    un mensaje se muestre como nota de voz (send_voice) en vez de como archivo.
+    """
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", "pipe:0",
+            "-c:a", "libopus",
+            "-b:a", "32k",
+            "-ar", "48000",
+            "-f", "ogg",
+            "pipe:1",
+        ],
+        input=wav_bytes,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg falló: {proc.stderr.decode(errors='ignore')[-300:]}")
+    return proc.stdout
+
+
+def synthesize_speech_ogg(text: str) -> bytes:
+    """Convierte texto a una nota de voz .ogg/Opus lista para enviar por Telegram
+    (Piper genera WAV; wav_bytes_to_ogg_opus hace la conversión final)."""
+    voice = get_piper_voice()
+
+    wav_buffer = io.BytesIO()
+    with wave.open(wav_buffer, "wb") as wav_file:
+        voice.synthesize_wav(text, wav_file)
+
+    return wav_bytes_to_ogg_opus(wav_buffer.getvalue())
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "¡Hola! Soy el asistente del huerto de Fundautonoma. "
+        "Pregúntame lo que quieras sobre el riego o las plantas."
+    )
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    user_text = update.message.text
+
+    try:
+        reply = process_user_message(chat_id, user_text)
+    except Exception:
+        log.exception("Fallo al consultar el LLM local (¿está LM Studio encendido?)")
+        reply = (
+            "Uy, en este momento no puedo pensar bien la respuesta. "
+            "Por favor intenta de nuevo en un momentico."
+        )
+
+    await update.message.reply_text(reply)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    tmp_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".oga", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        tg_file = await update.message.voice.get_file()
+        await tg_file.download_to_drive(tmp_path)
+
+        user_text = transcribe_audio(tmp_path)
+        if not user_text:
+            await update.message.reply_text(
+                "No logré entender el audio. ¿Puedes intentar de nuevo, por favor?"
+            )
+            return
+
+        reply = process_user_message(chat_id, user_text)
+
+    except Exception:
+        log.exception("Fallo al procesar la nota de voz")
+        await update.message.reply_text(
+            "Uy, no pude procesar el audio. Intenta de nuevo o escribe tu pregunta."
+        )
+        return
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    # Responder en voz (mismo canal que usó el usuario); si la síntesis falla,
+    # el cuidador igual recibe la respuesta en texto en vez de quedarse sin nada.
+    try:
+        ogg_bytes = synthesize_speech_ogg(reply)
+        await update.message.reply_voice(voice=io.BytesIO(ogg_bytes))
+    except Exception:
+        log.exception("Fallo la síntesis de voz; respondo en texto como respaldo")
+        await update.message.reply_text(reply)
+
+
+def main() -> None:
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+
+    log.info("Bot iniciado. Escuchando mensajes de Telegram...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
