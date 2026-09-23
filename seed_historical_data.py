@@ -16,10 +16,11 @@ Uso:
 
 Todos los documentos se marcan con "prueba_historica": true para poder
 borrarlos después sin tocar datos reales:
-    mongosh huerto --eval 'db.telemetria.deleteMany({prueba_historica:true}); db.eventos.deleteMany({prueba_historica:true})'
+    mongosh --port 27019 huerto --eval 'db.telemetria.deleteMany({prueba_historica:true}); db.eventos.deleteMany({prueba_historica:true})'
 """
 
 import argparse
+import os
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -98,7 +99,11 @@ def generar_serie(horas: int, paso_min: int = 5, seed: int = 7):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hours", type=int, default=48)
-    parser.add_argument("--mongo-uri", default="mongodb://localhost:27017")
+    # Antes: default fijo a 27017, sin relación con MONGO_URI del .env --
+    # quedó desactualizado en cuanto el puerto real cambió. Ahora lee la
+    # misma variable de entorno que usa config.py, con el mismo fallback
+    # (27019) como red de seguridad si se corre suelto, fuera de Docker.
+    parser.add_argument("--mongo-uri", default=os.environ.get("MONGO_URI", "mongodb://localhost:27019"))
     parser.add_argument("--db", default="huerto")
     parser.add_argument("--clear", action="store_true", help="Solo borrar datos de prueba histórica anteriores")
     args = parser.parse_args()

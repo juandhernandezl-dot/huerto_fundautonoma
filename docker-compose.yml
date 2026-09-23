@@ -1,0 +1,86 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: huerto-mongo
+    restart: unless-stopped
+    network_mode: host
+    # --bind_ip 127.0.0.1: igual razón que en motor -- con network_mode
+    # host, el default de la imagen (0.0.0.0) dejaría la base escuchando
+    # en toda la red local sin autenticación. --port 27019, no 27017: así
+    # el mongod nativo del host puede quedarse corriendo (o apagado, ya
+    # no importa) sin pelear nunca más por el puerto.
+    command: ["--bind_ip", "127.0.0.1", "--port", "27019"]
+    volumes:
+      - mongo_data:/data/db
+    labels:
+      autoheal: "true"
+    healthcheck:
+      test: ["CMD", "mongosh", "--port", "27019", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  node-red:
+    image: nodered/node-red:latest
+    container_name: huerto-node-red
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /home/reds7/.node-red:/data
+    depends_on:
+      mongo:
+        condition: service_started
+    labels:
+      autoheal: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:1880/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-small}
+        WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-int8}
+    container_name: huerto-bot
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - .:/app
+      - huggingface_cache:/opt/hf_cache
+    working_dir: /app
+    env_file:
+      - .env
+    command: python3 bot.py
+    depends_on:
+      mongo:
+        condition: service_started
+    labels:
+      autoheal: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'python3 bot.py' > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: autoheal
+    restart: always
+    network_mode: none
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: "autoheal"
+      AUTOHEAL_INTERVAL: "5"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/localtime:/etc/localtime:ro
+
+volumes:
+  mongo_data:
+  huggingface_cache:
