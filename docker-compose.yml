@@ -9,7 +9,9 @@ services:
     # en toda la red local sin autenticación. --port 27019, no 27017: así
     # el mongod nativo del host puede quedarse corriendo (o apagado, ya
     # no importa) sin pelear nunca más por el puerto.
-    command: ["--bind_ip", "127.0.0.1", "--port", "27019"]
+    # --wiredTigerCacheSizeGB 0.5: la telemetría es diminuta; el default
+    # (50% de la RAM) sobra y en la Raspberry Pi compite con el LLM.
+    command: ["--bind_ip", "127.0.0.1", "--port", "27019", "--wiredTigerCacheSizeGB", "0.5"]
     volumes:
       - mongo_data:/data/db
     labels:
@@ -27,7 +29,8 @@ services:
     restart: unless-stopped
     network_mode: host
     volumes:
-      - /home/reds7/.node-red:/data
+      # NODERED_DATA se define en .env; el default conserva la ruta del PC.
+      - ${NODERED_DATA:-/home/reds7/.node-red}:/data
     depends_on:
       mongo:
         condition: service_started
