@@ -1,8 +1,14 @@
+# Contexto de build del bot. El Dockerfile solo copia requirements.txt
+# (el código entra por bind mount), así que esto no cambia la imagen: solo
+# evita mandarle al daemon carpetas pesadas o con secretos en cada build.
+.env
+.env.*
 venv/
 __pycache__/
 *.pyc
-logs/*.log
+logs/
 .git
 otros/
+node-red/
 tests/__pycache__/
 bot.py.monolito-bak

@@ -12,9 +12,20 @@ import os
 # Telegram / LLM
 # --------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]  # obligatorio, sin default
+# Backend del LLM: "ollama" (contenedor huerto-ollama, API nativa /api/chat)
+# u "openai" (cualquier servidor compatible con OpenAI, p.ej. LM Studio en
+# el host). OJO: el nombre del modelo cambia según el backend -- Ollama lo
+# llama "qwen3.5:4b", LM Studio "qwen3.5-4b".
+LLM_BACKEND = os.environ.get("LLM_BACKEND", "ollama").strip().lower()
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11435")
+# Cuánto tiempo deja Ollama el modelo cargado en RAM tras cada llamada.
+# Largo a propósito: en CPU (PC donado, Raspberry Pi 5) recargar los ~3 GB
+# del modelo en cada pregunta costaría más que la respuesta misma.
+OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "24h")
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "4096"))
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:1234/v1")
-LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.5-4b")
-LLM_API_KEY = os.environ.get("LLM_API_KEY", "lm-studio")  # LM Studio ignora el valor
+LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.5:4b" if LLM_BACKEND == "ollama" else "qwen3.5-4b")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "lm-studio")  # solo backend "openai"; LM Studio ignora el valor
 MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", "4"))
 REQUEST_TIMEOUT_S = int(os.environ.get("REQUEST_TIMEOUT_S", "60"))
 

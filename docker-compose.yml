@@ -40,6 +40,57 @@ services:
       retries: 3
       start_period: 30s
 
+  ollama:
+    # Servidor del LLM dentro de Docker -- reemplaza a LM Studio en el host
+    # (rama agente-ollama). Imagen multi-arquitectura: la misma línea sirve
+    # en el PC (amd64) y en la Raspberry Pi 5 (arm64). Corre SOLO en CPU:
+    # la GPU del PC de desarrollo no se pudo usar desde el contenedor (ver
+    # prueba_agente), y la Pi y el PC donado no tienen GPU NVIDIA, así que
+    # CPU es además el escenario real de despliegue.
+    image: ollama/ollama:latest
+    container_name: huerto-ollama
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # 11435 y no el 11434 por defecto: así no choca con un Ollama nativo
+      # que pueda estar instalado en el host (mismo criterio que Mongo en
+      # 27019). Solo localhost, igual que Mongo: sin exposición a la LAN.
+      OLLAMA_HOST: "127.0.0.1:11435"
+      # Hardware pequeño (PC donado sin GPU, Raspberry Pi 5): un solo modelo
+      # y una sola petición a la vez, para no duplicar el uso de RAM.
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_NUM_PARALLEL: "1"
+    volumes:
+      # Los ~3 GB del modelo viven aquí: sobreviven a down/up y a rebuilds.
+      - ollama_data:/root/.ollama
+    labels:
+      autoheal: "true"
+    healthcheck:
+      # La imagen no trae curl/wget; el propio cliente `ollama` consulta al
+      # servidor (lee OLLAMA_HOST) y falla si no responde.
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  ollama-pull:
+    # Tarea de una sola vez: descarga el modelo si todavía no está en el
+    # volumen. Si ya está, termina en segundos. Sin esto, en un equipo
+    # recién instalado el bot respondería "no puedo pensar" hasta que
+    # alguien hiciera el pull a mano.
+    image: ollama/ollama:latest
+    container_name: huerto-ollama-pull
+    network_mode: host
+    environment:
+      OLLAMA_HOST: "127.0.0.1:11435"
+    entrypoint: ["ollama"]
+    command: ["pull", "${LLM_MODEL:-qwen3.5:4b}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
   bot:
     build:
       context: .
@@ -59,6 +110,11 @@ services:
     command: python3 bot.py
     depends_on:
       mongo:
+        condition: service_started
+      # service_started, no service_healthy: igual que con Mongo, el bot
+      # sabe degradarse solo (responde RESPUESTA_LLM_FALLO) si el modelo
+      # todavía no está listo; no tiene sentido bloquear su arranque.
+      ollama:
         condition: service_started
     labels:
       autoheal: "true"
@@ -84,3 +140,4 @@ services:
 volumes:
   mongo_data:
   huggingface_cache:
+  ollama_data:

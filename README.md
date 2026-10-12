@@ -1,6 +1,7 @@
 # Bot de Telegram — Huerto Fundautonoma (MVP lean + voz)
 
-Bot que conecta Telegram con el LLM local (Qwen3.5-4B vía LM Studio),
+Bot que conecta Telegram con el LLM local (Qwen3.5-4B servido por Ollama en un
+contenedor Docker; LM Studio en el host queda como backend alternativo),
 ya elegido tras la evaluación a ciegas con usuarios. Sin frameworks de agentes.
 Soporta texto y notas de voz (faster-whisper para escuchar, Piper para hablar).
 
@@ -13,7 +14,7 @@ Soporta texto y notas de voz (faster-whisper para escuchar, Piper para hablar).
    `telemetria`, la de la Opción A) en cada mensaje, y se la pasa al LLM como
    contexto — así puede responder con datos verdaderos, no inventados.
 ✅ Mantiene un historial corto por conversación (en memoria, se pierde al reiniciar).
-✅ Maneja el caso de que LM Studio, MongoDB o la voz no estén disponibles,
+✅ Maneja el caso de que el servidor del modelo (Ollama), MongoDB o la voz no estén disponibles,
    sin romperse (cae a texto / dice que no hay datos).
 
 ❌ No usa Hermes Agent ni LangChain — si este MVP se queda corto, esa es la migración de fase 2.
@@ -82,12 +83,35 @@ Cárgalas en la terminal antes de correr el bot:
 export $(grep -v '^#' .env | xargs)
 ```
 
-## 3. Encender el LLM local (LM Studio)
+## 3. El LLM local (Ollama en contenedor)
 
-1. Abre LM Studio, carga **qwen3.5-4b** (el modelo ganador de las pruebas).
-2. Ve a la pestaña **Local Server** (icono `<->`) y actívalo.
-3. Confirma que el nombre del modelo mostrado ahí coincide con `LLM_MODEL` en tu `.env`.
-   Por defecto sirve en `http://localhost:1234/v1` (ya es el default del bot).
+Desde la rama `agente-ollama`, el modelo ya no depende de LM Studio: corre en
+el contenedor `huerto-ollama`, **solo en CPU**, y se levanta con el resto del
+stack (Mongo, Node-RED, bot y autoheal):
+
+```bash
+docker compose up -d --build
+```
+
+- La primera vez, el servicio `ollama-pull` descarga `qwen3.5:4b` (~3.3 GB) al
+  volumen `ollama_data`. Sigue el progreso con `docker compose logs -f ollama-pull`
+  (repite "pulling manifest" mientras descarga; al terminar el contenedor queda
+  en "Exited (0)", es normal). Mientras no termine, el bot responde su mensaje
+  de fallo en vez de colgarse.
+- Ollama escucha en `127.0.0.1:11435` (no 11434, para no chocar con un Ollama
+  nativo). Se usa su API **nativa** `/api/chat` porque es la única que respeta
+  `think: false` en Qwen3.5.
+- Prueba directa del modelo, sin el bot:
+```bash
+  curl -s localhost:11435/api/chat -d '{"model":"qwen3.5:4b","think":false,"stream":false,"messages":[{"role":"user","content":"Hola"}]}'
+```
+- En `.env` el modelo se llama `qwen3.5:4b` (con dos puntos). Con
+  `qwen3.5-4b` (el nombre de LM Studio) Ollama responde 404.
+- Por qué solo CPU: la GPU del PC de desarrollo (RTX 3050, 4 GB) no se pudo
+  usar desde el contenedor (ver `prueba_agente`), y el despliegue final
+  (Raspberry Pi 5 / PC donado) no tiene GPU NVIDIA.
+- Para volver a LM Studio en el host: `LLM_BACKEND=openai` y `LLM_MODEL=qwen3.5-4b`
+  en `.env`, y `docker compose restart bot`.
 
 ## 4. Correr el bot
 
@@ -104,13 +128,14 @@ Abre Telegram, busca tu bot por su username, y mándale `/start` y luego cualqui
 
 ## 5. Probar la lógica sin Telegram (ya incluido y verificado)
 
-`test_smoke.py` simula el servidor de LM Studio para probar que `ask_llm()`
-arma bien la petición y guarda el historial, y además verifica la conversión
+`tests/test_smoke.py` simula el servidor del modelo (Ollama nativo y
+compatible con OpenAI) para probar que `ask_llm()` arma bien la petición en
+ambos backends y guarda el historial, y además verifica la conversión
 de audio WAV → OGG/Opus (el formato que exige Telegram), todo sin necesitar
-token real ni LM Studio encendido:
+token real ni servidor de modelo encendido:
 
 ```bash
-python3 test_smoke.py
+python3 tests/test_smoke.py
 ```
 
 > Esta prueba **no** cubre Whisper ni Piper de extremo a extremo (transcribir

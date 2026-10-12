@@ -1,7 +1,8 @@
 """
 Prueba de humo: valida que llm_client.ask_llm() arma bien la petición y
-procesa la respuesta, usando un servidor HTTP falso en vez de LM Studio
-real. No usa Telegram ni requiere token real.
+procesa la respuesta en sus dos backends (Ollama nativo /api/chat y
+compatible con OpenAI /v1/chat/completions), usando un servidor HTTP falso
+en vez de un servidor de modelo real. No usa Telegram ni requiere token real.
 """
 import io
 import json
@@ -22,31 +23,45 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Variables de entorno ANTES de importar config.py (config.py las lee al
 # importarse, y todos los demás módulos importan config).
 os.environ["TELEGRAM_BOT_TOKEN"] = "dummy-token-para-test"
+os.environ["LLM_BACKEND"] = "ollama"
+os.environ["OLLAMA_BASE_URL"] = "http://localhost:8765"
 os.environ["LLM_BASE_URL"] = "http://localhost:8765/v1"
-os.environ["LLM_MODEL"] = "qwen3.5-4b"
+os.environ.pop("LLM_MODEL", None)  # que config.py elija el nombre por backend
+
+# Último cuerpo recibido por el servidor falso, por ruta -- para poder
+# afirmar QUÉ se envió, no solo que la respuesta llegó.
+ULTIMO_BODY = {}
 
 
-class FakeLMStudioHandler(BaseHTTPRequestHandler):
+class FakeLLMHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length))
-        self.received_messages = body.get("messages", [])
+        ULTIMO_BODY[self.path] = body
 
         fake_reply = (
             "¡Hola! Le cuento que regamos la zona uno para que esté bien "
             "jugosa y la otra ya está lista, todo en orden."
         )
-        response = {
-            "id": "chatcmpl-fake",
-            "object": "chat.completion",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": fake_reply},
-                    "finish_reason": "stop",
-                }
-            ],
-        }
+        if self.path == "/api/chat":  # API nativa de Ollama
+            response = {
+                "model": body.get("model"),
+                "message": {"role": "assistant", "content": fake_reply},
+                "done": True,
+                "done_reason": "stop",
+            }
+        else:  # /v1/chat/completions (compatible con OpenAI)
+            response = {
+                "id": "chatcmpl-fake",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": fake_reply},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
         payload = json.dumps(response).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -59,7 +74,7 @@ class FakeLMStudioHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    server = HTTPServer(("localhost", 8765), FakeLMStudioHandler)
+    server = HTTPServer(("localhost", 8765), FakeLLMHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
@@ -83,6 +98,30 @@ def main():
     history_len = len(llm_client._history[1])
     print(f"Mensajes en historial tras 2 turnos: {history_len}")
     assert history_len == 4, "Se esperaban 4 mensajes (2 turnos user+assistant)"
+
+    print("\n--- Payload enviado a Ollama (API nativa) ---")
+    body = ULTIMO_BODY["/api/chat"]
+    assert body["model"] == "qwen3.5:4b", f"Nombre de modelo de Ollama inesperado: {body['model']}"
+    assert body["think"] is False, "Debe desactivar el razonamiento con think=false"
+    assert body["stream"] is False
+    roles = [m["role"] for m in body["messages"]]
+    assert roles.count("system") == 1 and roles[0] == "system", "Un solo system, en la posición 0"
+    assert roles == ["system", "user", "assistant", "user"], f"Orden inesperado: {roles}"
+    assert body["messages"][-1]["content"] == "¿Y la zona 2?", "La ruta Ollama no lleva /no_think"
+    assert body["options"]["num_predict"] == 300
+    print("modelo, think=false, un solo system, historial y sin /no_think ✅")
+
+    print("\n--- Backend alternativo: compatible con OpenAI (LM Studio) ---")
+    config.LLM_BACKEND = "openai"
+    config.LLM_MODEL = "qwen3.5-4b"
+    reply_oa = llm_client.ask_llm(chat_id=99, user_text="¿Cómo está la zona 3?")
+    body_oa = ULTIMO_BODY["/v1/chat/completions"]
+    assert reply_oa and body_oa["model"] == "qwen3.5-4b"
+    assert body_oa["messages"][-1]["content"].endswith("/no_think")
+    assert body_oa["chat_template_kwargs"] == {"enable_thinking": False}
+    print("Respuesta:", reply_oa)
+    config.LLM_BACKEND = "ollama"
+    config.LLM_MODEL = "qwen3.5:4b"
 
     print("\n--- Formateo de telemetría (con documento sintético, igual al real) ---")
     doc_reciente = {
@@ -185,7 +224,7 @@ def main():
         "entorno. Esa parte se valida en tu máquina siguiendo el README."
     )
 
-    print("\n✅ Smoke test OK: llm_client.ask_llm arma la petición, llama al servidor, "
+    print("\n✅ Smoke test OK: llm_client.ask_llm arma la petición (Ollama y OpenAI), llama al servidor, "
           "guarda historial, comandos.py/consultas.py detectan sin invocar al LLM, y "
           "la conversión de audio para notas de voz funciona.")
     server.shutdown()
