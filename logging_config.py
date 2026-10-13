@@ -6,9 +6,23 @@ de una sesión de pruebas sin depender del scrollback de la terminal.
 """
 import logging
 import os
+import re
 from logging.handlers import RotatingFileHandler
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+
+# httpx registra en INFO la URL completa de cada petición, y la API de
+# Telegram lleva el token dentro de la URL (.../bot<ID>:<SECRETO>/getUpdates):
+# sin esto, el token quedaba escrito en consola y en logs/bot.log cada ~10 s.
+_TOKEN_TELEGRAM = re.compile(r"bot\d+:[A-Za-z0-9_-]+")
+
+
+class _FormatoSeguro(logging.Formatter):
+    """Igual que Formatter, pero tapa el token de Telegram en el texto ya
+    formateado (mensaje y traceback), venga del logger que venga."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return _TOKEN_TELEGRAM.sub("bot<TOKEN>", super().format(record))
 
 
 def setup_logging() -> None:
@@ -16,7 +30,7 @@ def setup_logging() -> None:
     proyecto -- así, avisos de import (ej. el chequeo de ffmpeg en voz.py)
     también quedan en el archivo, no solo en consola."""
     os.makedirs(LOG_DIR, exist_ok=True)
-    formato = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    formato = _FormatoSeguro("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     consola = logging.StreamHandler()
     consola.setFormatter(formato)
