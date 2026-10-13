@@ -11,10 +11,13 @@ from logging.handlers import RotatingFileHandler
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
-# httpx registra en INFO la URL completa de cada petición, y la API de
-# Telegram lleva el token dentro de la URL (.../bot<ID>:<SECRETO>/getUpdates):
-# sin esto, el token quedaba escrito en consola y en logs/bot.log cada ~10 s.
-_TOKEN_TELEGRAM = re.compile(r"bot\d+:[A-Za-z0-9_-]+")
+# El token de Telegram aparece en logs de tres formas: en la URL de la API
+# (.../bot<ID>:<SECRETO>/getUpdates), en la URL de descarga de archivos
+# (.../file/bot<ID>%3A<SECRETO>/voice/..., con ":" codificado como %3A) y en
+# el texto de telegram.error.InvalidToken (sin prefijo "bot"). El patrón
+# reconoce la forma del token (ID numérico, ":" o "%3A", 30+ caracteres),
+# no el contexto, para cubrir todas y cualquier otra que aparezca.
+_TOKEN_TELEGRAM = re.compile(r"(?:bot)?\d{6,}(?::|%3[Aa])[A-Za-z0-9_-]{30,}")
 
 
 class _FormatoSeguro(logging.Formatter):
@@ -22,7 +25,7 @@ class _FormatoSeguro(logging.Formatter):
     formateado (mensaje y traceback), venga del logger que venga."""
 
     def format(self, record: logging.LogRecord) -> str:
-        return _TOKEN_TELEGRAM.sub("bot<TOKEN>", super().format(record))
+        return _TOKEN_TELEGRAM.sub("<TOKEN>", super().format(record))
 
 
 def setup_logging() -> None:
