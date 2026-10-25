@@ -7,6 +7,13 @@ Se usan **3 terminales** (A, B, C). Cada paso dice cuál.
 
 ## 0. Antes de empezar
 
+- Confirma que tienes los archivos de esta guía (si alguno falta, te falta aplicar un parche):
+
+```bash
+cd ~/Documents/huerto-bot
+ls tests/simulador_esp32.py tests/chat_consola.py tests/limpiar_pruebas.js requirements-test.txt
+```
+
 - **Apaga el ESP32 real** (o desconéctalo del Wi-Fi). El simulador publica en
   `huerto/general`; dos "ESP32" a la vez mezclarían telemetrías, y el simulador
   escribiría datos falsos en tu Mongo mientras el real también escribe.
@@ -196,32 +203,95 @@ tarda como máximo 60 s en caducar.
 
 ## 8. Limpiar y apagar
 
-En el simulador: `q`. La prueba deja datos falsos en Mongo (el simulador publica
-humedades y válvulas que Node-RED guarda como si fueran reales; se ven como
-saltos en el histórico del dashboard). Con el ESP32 real apagado durante toda la
-prueba, borra lo posterior a su inicio con `tests/limpiar_pruebas.js`, desde
-`~/Documents/huerto-bot` y en el host (necesita `mongosh`):
+En el simulador: `q`. La prueba deja datos falsos en Mongo: el simulador publica
+humedades y válvulas que Node-RED guarda como si fueran reales (se ven como saltos
+en el histórico del dashboard). Se limpia con `tests/limpiar_pruebas.js`, desde
+`~/Documents/huerto-bot` y en el host (necesita `mongosh`). Escribe cada comando
+tal cual, sin las líneas de ``` .
+
+**Paso 1 — respaldo (siempre):**
 
 ```bash
-# 1) respaldo, siempre antes de borrar
 docker compose exec mongo mongodump --port 27019 --db huerto --archive=/data/db/respaldo_$(date +%F_%H%M).archive
-
-# 2) borrar SOLO lo posterior al inicio de la prueba
-DESDE=$(cat /tmp/inicio_pruebas) mongosh --port 27019 huerto --quiet --file tests/limpiar_pruebas.js
 ```
 
-Si no creaste `/tmp/inicio_pruebas`, pon la fecha a mano en UTC:
-`DESDE=2026-10-25T04:30:00Z mongosh ...` (la hora que muestra el simulador es UTC).
-
-Para vaciar **todo** el historial (`telemetria` y `eventos`), solo si quieres empezar de cero:
+**Paso 2a — vaciar TODO** (`telemetria` y `eventos`; úsalo mientras no haya datos reales):
 
 ```bash
 BORRAR_TODO=si mongosh --port 27019 huerto --quiet --file tests/limpiar_pruebas.js
 ```
 
-El script imprime cuántos documentos hay antes, cuántos borra y cuántos quedan.
-Si tu MongoDB no permite borrar por fecha en una colección de series de tiempo,
-reconstruye `telemetria` conservando lo anterior y deja una copia en
-`telemetria_conservada` para que la borres tú cuando verifiques.
+**Paso 2b — borrar solo lo posterior al inicio de la prueba** (cuando ya haya datos reales
+antes). `DESDE` va en UTC, la hora que muestra el simulador:
 
-Después enciende el ESP32 real. Si no vas a seguir: `docker compose down`.
+```bash
+DESDE=2026-10-25T04:30:00Z mongosh --port 27019 huerto --quiet --file tests/limpiar_pruebas.js
+```
+
+El script imprime cuántos documentos hay antes, cuántos borra y cuántos quedan. Esperado
+tras 2a: `Después: telemetria=0  eventos=0`. Con el ESP32 real encendido, `telemetria`
+vuelve a llenarse sola a un documento por minuto.
+
+Si tu MongoDB no permite borrar por fecha en la colección de series de tiempo (solo
+pasa en 2b), el script la reconstruye conservando lo anterior y deja una copia en
+`telemetria_conservada`; bórrala tú cuando verifiques con
+`mongosh --port 27019 huerto --quiet --eval 'db.telemetria_conservada.drop()'`.
+
+Para volver atrás con el respaldo del paso 1 (restaura sobre lo que haya):
+
+```bash
+docker compose exec mongo mongorestore --port 27019 --drop --archive=/data/db/respaldo_AAAA-MM-DD_HHMM.archive
+```
+
+Si no vas a seguir: `docker compose down`.
+
+## 9. Pasar al ESP32 real
+
+Todo lo anterior prueba el software (bot, Node-RED, MQTT). El simulador **no
+imita** el CAN, los relés ni el bloqueo del firmware cuando se cae el broker, así
+que esta parte se hace aparte y por etapas. Si una etapa falla, no pases a la siguiente.
+
+**Antes de encender (con el simulador apagado: `q`):**
+- Confirma que el firmware cargado en el receptor y en los nodos es el que usas.
+  Está sin verificar que el mensaje de modo por CAN coincida entre `receptor.ino` y
+  `emisores.ino` (el receptor lo envía con 1 byte y el nodo espera [nodo, modo]).
+  Si tu receptor ignora el cambio de modo, las órdenes del bot no tendrán efecto
+  físico aunque Node-RED las confirme. Pruébalo en la etapa 2.
+- Ten a mano el **corte físico** (interruptor de la bomba o de la alimentación) y
+  rotúlalo. Si cae el PC, Node-RED o el broker, el ESP32 se queda esperando
+  reconexión con los relés en su último estado: eso solo lo corta el interruptor.
+- Limpia los datos falsos (sección 8) para que el histórico empiece con datos reales.
+
+**Etapa 1 — solo telemetría (sin tocar nada físico).** Enciende el ESP32 real.
+
+```bash
+mosquitto_sub -h localhost -t huerto/general -C 2
+docker compose logs --tail 20 node-red | grep -i "estado seguro"
+```
+
+Esperado: dos JSON con tus humedades reales y `"bomba":0`, y `Estado seguro aplicado: arranque`.
+En el chat: `¿cómo está la zona 1?` debe mostrar la humedad real con "Hace N segundos".
+Un minuto después debe haber un documento nuevo en `telemetria`.
+
+**Etapa 2 — modo y una válvula, con la bomba desconectada y sin agua.**
+En el chat: `pon el modo manual` → `sí`; `abre la válvula 1` → `sí`.
+Esperado: la electroválvula de la zona 1 se oye o se ve abrir, y la respuesta dice
+"Listo… se cierra sola a las HH:MM". Si dice "no pude confirmar", la orden no
+llegó al hardware: no sigas. Después `cierra la válvula 1` y `vuelve a automático`:
+la válvula cierra y el huerto vuelve a regar por umbrales.
+
+**Etapa 3 — bomba.** Con agua y alguien presente: manual, abre una válvula y
+`enciende la bomba`. Comprueba que `enciende la bomba` **sin** válvula abierta la
+rechaza. Cierra todo y `vuelve a automático`.
+
+**Etapa 4 — los topes con el hardware real.** Repite la sección 5 (constantes cortas)
+con una válvula y la bomba reales y alguien vigilando, y devuelve las constantes originales.
+
+**Etapa 5 — fallas.** Con la bomba desconectada y una válvula abierta desde el bot:
+apaga el ESP32 → el bot responde que no hay telemetría y al volver aplica el estado
+seguro. No pruebes caída de Mosquitto con la bomba encendida: el ESP32 quedaría con
+el relé como estaba hasta que vuelva el broker.
+
+**Qué sigue fuera de esta guía** (no está resuelto): firmware sin bloqueo en
+`reconnect()`, cierre local por tiempo en el ESP32, y relés en apagado al arrancar.
+Hasta entonces el único corte garantizado ante caída del PC es el interruptor físico.
