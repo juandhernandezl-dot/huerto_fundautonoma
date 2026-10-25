@@ -50,4 +50,13 @@ ARG WHISPER_MODEL_SIZE=small
 ARG WHISPER_COMPUTE_TYPE=int8
 RUN python3 -c "from faster_whisper import WhisperModel; WhisperModel('$WHISPER_MODEL_SIZE', device='cpu', compute_type='$WHISPER_COMPUTE_TYPE')"
 
+# Dependencias SOLO de las pruebas (simulador del ESP32). Va al final para no
+# invalidar la capa que hornea el modelo de Whisper. Aquí se actualiza pip y
+# se silencian los avisos de "root"/"nueva versión" de pip en `docker compose exec`.
+ENV PIP_ROOT_USER_ACTION=ignore \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+COPY requirements-test.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements-test.txt
+
 CMD ["python3", "bot.py"]

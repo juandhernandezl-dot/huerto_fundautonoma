@@ -7,6 +7,7 @@ consultas.resolver_consulta_determinista() (Decisión 5, respuesta exacta
 sin invocar al modelo).
 """
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 
 from pymongo import MongoClient
@@ -28,16 +29,141 @@ def get_mongo_client() -> MongoClient:
     return _mongo_client
 
 
+# --- Órdenes recién confirmadas -------------------------------------------
+# Mongo recibe como máximo un documento por minuto; una orden confirmada
+# por Node-RED (telemetría en vivo) puede ser más nueva que el último
+# documento. Mientras eso ocurra, la respuesta de estado refleja la orden y
+# lo dice. Lo mismo vale para los cambios que Node-RED registra en `eventos`
+# (dashboard, llave a mano). En cuanto entra un documento posterior, Mongo
+# vuelve a mandar; una orden sin documento posterior caduca (ORDEN_VIGENCIA_S).
+# Es memoria del proceso del bot: si se reinicia, se pierde y se responde
+# solo con Mongo (que es lo correcto después de un minuto).
+ORDEN_VIGENCIA_S = 120
+AVISO_GUARDADO = (
+    "Se guarda un dato por minuto: si algo cambió hace menos de un minuto, "
+    "puede no verse todavía."
+)
+_NOMBRE_ACTUADOR = {
+    "valvula1": "la válvula de la zona 1", "valvula2": "la válvula de la zona 2",
+    "valvula3": "la válvula de la zona 3", "bomba": "la bomba",
+}
+_ordenes: dict[str, tuple[int, datetime]] = {}
+_ordenes_lock = threading.Lock()
+
+
+def registrar_orden(campo: str, valor: int) -> None:
+    """Llamar solo cuando Node-RED respondió 'confirmado' para esa orden."""
+    if campo in _NOMBRE_ACTUADOR:
+        with _ordenes_lock:
+            _ordenes[campo] = (int(valor), datetime.now(timezone.utc))
+
+
+def _con_utc(ts: datetime) -> datetime:
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+_TIPO_EVENTO = {  # tipo en la colección eventos -> (campo, valor)
+    "valvula_abierta": ("valvula", 1), "valvula_cerrada": ("valvula", 0),
+    "riego_on": ("bomba", 1), "riego_off": ("bomba", 0),
+}
+
+
+def _eventos_desde(ts_doc: datetime) -> dict[str, tuple[int, datetime]]:
+    """Último cambio de cada actuador registrado en `eventos` DESPUÉS del
+    documento de telemetria. Node-RED escribe ese evento al instante en que
+    ve el cambio (venga de Telegram, del dashboard o de una llave a mano),
+    sin esperar al guardado de 1 doc/min. Si Mongo falla, devuelve {}."""
+    try:
+        col = get_mongo_client()[config.MONGO_DB][config.EVENTOS_COLLECTION]
+        cursor = col.find({"tipo": {"$in": list(_TIPO_EVENTO)}, "timestamp": {"$gt": ts_doc}}) \
+                    .sort("timestamp", 1)
+        salida = {}
+        for ev in cursor:
+            base, valor = _TIPO_EVENTO.get(ev.get("tipo"), (None, None))
+            if base == "valvula" and ev.get("zona") in (1, 2, 3):
+                salida[f"valvula{ev['zona']}"] = (valor, _con_utc(ev["timestamp"]))
+            elif base == "bomba":
+                salida["bomba"] = (valor, _con_utc(ev["timestamp"]))
+        return salida
+    except PyMongoError as e:
+        log.warning("No se pudieron leer eventos de MongoDB: %s", e)
+        return {}
+
+
+def aplicar_ordenes(doc: dict | None) -> dict | None:
+    """Copia de doc con el estado de los actuadores que cambiaron DESPUÉS del
+    timestamp del documento: por una orden confirmada de este bot, o por un
+    evento registrado en Mongo (lo más nuevo gana). Deja en doc['_ordenes']
+    {campo: (instante, 'orden'|'evento')} para poder avisarlo en el texto.
+    Con doc=None devuelve None."""
+    if doc is None:
+        return None
+    ahora = datetime.now(timezone.utc)
+    ts_doc = _con_utc(doc["timestamp"])
+    candidatos = {}
+    with _ordenes_lock:
+        for campo, (valor, t) in list(_ordenes.items()):
+            if (ahora - t).total_seconds() > ORDEN_VIGENCIA_S:
+                del _ordenes[campo]
+            elif t > ts_doc:
+                candidatos[campo] = (valor, t, "orden")
+    for campo, (valor, t) in _eventos_desde(ts_doc).items():
+        if campo not in candidatos or t > candidatos[campo][1]:
+            candidatos[campo] = (valor, t, "evento")
+    if not candidatos:
+        return doc
+    salida = dict(doc)
+    salida["_ordenes"] = {}
+    for campo, (valor, t, fuente) in candidatos.items():
+        salida[campo] = valor
+        salida["_ordenes"][campo] = (t, fuente)
+    return salida
+
+
+def edad_texto(ts: datetime) -> str:
+    """'Hace 40 segundos' / 'Hace 5 minutos'. Con menos de minuto y medio
+    se dan segundos: 'Hace 0 minutos' junto a un estado que acaba de
+    cambiar confundía más de lo que informaba."""
+    seg = max(0, int((datetime.now(timezone.utc) - _con_utc(ts)).total_seconds()))
+    if seg < 90:
+        return f"Hace {seg} segundos"
+    return f"Hace {seg // 60} minutos"
+
+
+def notas_ordenes(doc: dict, campos=None) -> list[str]:
+    """Una frase por actuador cuyo estado viene de una orden reciente y no
+    de Mongo. campos=None incluye todos."""
+    ahora = datetime.now(timezone.utc)
+    notas = []
+    for campo, (t, fuente) in (doc.get("_ordenes") or {}).items():
+        if campos is not None and campo not in campos:
+            continue
+        if doc.get(campo) == 1:
+            estado = "encendida" if campo == "bomba" else "abierta"
+        else:
+            estado = "apagada" if campo == "bomba" else "cerrada"
+        seg = max(0, int((ahora - t).total_seconds()))
+        origen = "Por tu orden confirmada" if fuente == "orden" else "Según el último cambio registrado"
+        notas.append(
+            f"{origen} hace {seg} segundos, {_NOMBRE_ACTUADOR[campo]} "
+            f"está {estado} (lo guardado en la base todavía es anterior)."
+        )
+    return notas
+
+
 def get_latest_telemetry() -> dict | None:
     """Consulta el documento más reciente de telemetria. Devuelve None si
     Mongo no responde o si la colección está vacía (nunca debe romper el bot).
+    Si hay una orden confirmada más nueva que ese documento, el estado de
+    ese actuador sale de la orden (ver aplicar_ordenes).
     """
     try:
         client = get_mongo_client()
-        return client[config.MONGO_DB][config.MONGO_COLLECTION].find_one(sort=[("timestamp", -1)])
+        doc = client[config.MONGO_DB][config.MONGO_COLLECTION].find_one(sort=[("timestamp", -1)])
     except PyMongoError as e:
         log.warning("No se pudo leer telemetria de MongoDB: %s", e)
         return None
+    return aplicar_ordenes(doc)
 
 
 def format_telemetry_for_llm(doc: dict | None) -> str:
@@ -53,7 +179,7 @@ def format_telemetry_for_llm(doc: dict | None) -> str:
         return "en línea" if v == 1 else "sin conexión"
 
     partes = [
-        f"Hace {edad_minutos:.0f} minutos:",
+        f"{edad_texto(doc['timestamp'])}:",
         f"zona 1 humedad {doc.get('zona1_humedad')}%,",
         f"zona 2 humedad {doc.get('zona2_humedad')}%,",
         f"zona 3 humedad {doc.get('zona3_humedad')}%,",
@@ -68,6 +194,8 @@ def format_telemetry_for_llm(doc: dict | None) -> str:
         f"conexión CAN zona 2: {estado_can(doc.get('can2_online'))},",
         f"conexión CAN zona 3: {estado_can(doc.get('can3_online'))}.",
     ]
+    partes.extend(notas_ordenes(doc))
+    partes.append(AVISO_GUARDADO)
     if edad_minutos > config.TELEMETRY_STALE_MINUTES:
         partes.append(
             f"AVISO: este dato tiene más de {config.TELEMETRY_STALE_MINUTES} minutos, "

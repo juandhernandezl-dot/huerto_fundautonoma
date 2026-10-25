@@ -192,7 +192,7 @@ def main():
 
     accion = comandos.detectar_accion("abre la válvula de la zona 1")
     assert accion == {"tipo": "abrir_valvula", "zona": "1"}
-    print("Acción detectada:", accion, "->", comandos.responder_accion_no_disponible(accion))
+    print("Acción detectada:", accion)
 
     assert comandos.detectar_accion("¿la bomba está encendida?") is None, \
         "una pregunta informativa no debe detectarse como acción"

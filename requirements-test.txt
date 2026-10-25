@@ -1,0 +1,4 @@
+# Solo para las pruebas (tests/simulador_esp32.py). El bot NO lo importa: nunca
+# habla MQTT, solo Node-RED. Se instala en la imagen para no repetir
+# `pip install` cada vez que se recrea el contenedor.
+paho-mqtt>=2,<3

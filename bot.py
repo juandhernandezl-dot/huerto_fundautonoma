@@ -78,6 +78,7 @@ def process_user_message(chat_id: int, user_text: str) -> str:
     comportamiento no diverja entre canales de entrada.
 
     Orden (cada etapa solo corre si la anterior no resolvió el mensaje):
+      0) Respuesta SÍ/NO a una orden física pendiente (comandos.py).
       1) Detección determinista de ACCIONES (comandos.py) -- pedidos de
          escribir hacia un actuador. Nunca llega al LLM.
       2) Resolutor determinista de CONSULTAS informativas (consultas.py,
@@ -89,10 +90,17 @@ def process_user_message(chat_id: int, user_text: str) -> str:
     sistema (ver ai.pdf): el LLM solo se invoca cuando ninguna de las dos
     etapas deterministas resolvió el mensaje, nunca antes.
     """
+    # 0) Respuesta SÍ/NO a una orden física pendiente de confirmación.
+    reply_confirmacion = comandos.resolver_confirmacion(chat_id, user_text)
+    if reply_confirmacion is not None:
+        log.info("Confirmación de acción resuelta | mensaje: %r", user_text)
+        llm_client.record_turn(chat_id, user_text, reply_confirmacion)
+        return reply_confirmacion
+
     accion = comandos.detectar_accion(user_text)
     if accion is not None:
-        log.info("Acción detectada (todavía sin ejecutar): %s | mensaje: %r", accion, user_text)
-        reply = comandos.responder_accion_no_disponible(accion)
+        log.info("Acción detectada: %s | mensaje: %r", accion, user_text)
+        reply = comandos.procesar_accion(chat_id, accion)
         llm_client.record_turn(chat_id, user_text, reply)
         return reply
 

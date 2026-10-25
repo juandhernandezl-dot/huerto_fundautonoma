@@ -30,6 +30,22 @@ MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", "4"))
 REQUEST_TIMEOUT_S = int(os.environ.get("REQUEST_TIMEOUT_S", "60"))
 
 # --------------------------------------------------------------------------
+# Acciones sobre actuadores (comandos.py -> API HTTP de Node-RED -> MQTT)
+# --------------------------------------------------------------------------
+# El bot no habla MQTT: Node-RED es la única ruta de escritura hacia el
+# ESP32 (valida modo, publica en riego/* y espera la confirmación en
+# huerto/general). 127.0.0.1 a propósito: el endpoint rechaza cualquier
+# petición que no venga de la propia máquina.
+NODERED_ACCION_URL = os.environ.get("NODERED_ACCION_URL", "http://127.0.0.1:1880/huerto/api/accion")
+# Debe ser MAYOR que el tiempo de espera de confirmación configurado en el
+# nodo de Node-RED (10 s); si no, el bot cortaría antes de saber el resultado.
+ACCION_TIMEOUT_S = int(os.environ.get("ACCION_TIMEOUT_S", "20"))
+# Cuánto tiempo espera el bot un SÍ antes de descartar una orden que abre
+# agua o pasa a manual. Corto a propósito: un "sí" de hace 10 minutos ya
+# no responde a la pregunta que el cuidador tiene en mente.
+CONFIRMACION_TTL_S = int(os.environ.get("CONFIRMACION_TTL_S", "60"))
+
+# --------------------------------------------------------------------------
 # Voz (STT: faster-whisper / TTS: Piper)
 # --------------------------------------------------------------------------
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")

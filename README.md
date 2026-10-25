@@ -152,6 +152,101 @@ python3 tests/test_smoke.py
 4. Si en cambio recibes texto, revisa los logs: lo más común es que
    `PIPER_VOICE_PATH` esté vacío o mal escrito, o que falte `ffmpeg`.
 
+## Acciones físicas (válvulas, bomba, modo)
+
+El bot puede abrir/cerrar válvulas, encender/apagar la bomba y cambiar el
+modo, pero **nunca publica MQTT**: hace POST a una API de Node-RED
+(`/huerto/api/accion`, solo desde la propia máquina), y el nodo
+**Supervisor riego** (`otros/nodered-supervisor-riego.js`) valida, publica a
+través de los switches del dashboard y confirma con la telemetría real.
+
+Reglas (consejo del 20 oct 2026, `acciones-agente/council-transcript.md` en el proyecto):
+
+- Abrir válvula, encender bomba o pasar a manual piden **SÍ/NO** repitiendo
+  la orden. Cerrar, apagar o volver a automático se ejecutan directo.
+- Órdenes ambiguas (dos zonas, zona 4, dos acciones, "no" antes de abrir)
+  se rechazan; nunca se adivina.
+- Abrir agua es un préstamo: en manual, cada válvula o la bomba se apaga
+  sola a los **20 min** (venga del bot o del dashboard; repetir "abre" no
+  reinicia el plazo), la bomba sin ninguna válvula abierta se apaga a los
+  **30 s**, y el manual vuelve solo a automático a los **30 min** (o al vencer
+  la última válvula). El bot le dice al cuidador la hora exacta.
+- Al arrancar Node-RED, o si la telemetría se corta más de 5 s (ESP32 o
+  broker reiniciados), todo va a 0 y a automático. Ningún tópico usa retain.
+
+**Límite conocido (no lo cierra el software del PC):** si caen el PC o el
+broker, el `reconnect()` bloqueante de `Receptor.ino` congela el ESP32 con el
+relé de la bomba como estaba. Hasta el cambio de firmware, la protección es
+el **corte físico rotulado** junto a la bomba.
+
+### Configurar Node-RED (a mano, en http://localhost:1880/)
+
+1. Función **control modo**: primera línea `flow.set("modo_riego", msg.payload);`
+2. Nodo **inject**: repetir cada 5 s, `msg.topic` = `tick`.
+3. Nodo **http in**: `POST`, URL `/huerto/api/accion`.
+4. Nodo **function** "Supervisor riego", **Outputs = 6**, con el contenido
+   de `otros/nodered-supervisor-riego.js`.
+5. Entradas del supervisor: el **http in**, el **inject** y la salida del
+   nodo **json** que parsea `huerto/general`.
+6. Salidas: 1 → **http response** nuevo; 2 → switch "Bomba Manual";
+   3 → "Modo Manual"; 4/5/6 → "ValvulaZona1/2/3". Deploy.
+
+`HUECO_TELEMETRIA_MS` (5 s) debe ser mayor que 3 periodos de publicación del
+ESP32. Si el firmware Wi-Fi publica más lento, súbelo o el supervisor
+aplicará el estado seguro sin parar.
+
+### Probar sin ESP32 (todo dentro del PC)
+
+Paso a paso, con `docker compose exec`, en [`tests/PRUEBAS_ACCIONES.md`](tests/PRUEBAS_ACCIONES.md):
+pruebas de lógica, ESP32 simulado (`tests/simulador_esp32.py`), chat por
+terminal sin Telegram (`tests/chat_consola.py`), topes, fallas (ESP32,
+Node-RED y Mosquitto caídos) y limpieza de los datos de prueba en Mongo.
+
+### Deshacer
+
+- Código: `git revert <commit>` (o, antes de aplicar, `git branch respaldo-antes-acciones`).
+- Node-RED: borra los nodos nuevos y la línea de "control modo", o restaura
+  tu respaldo con el contenedor detenido:
+  `docker compose stop node-red && cp ~/respaldo/flows.json ~/.node-red/flows.json && docker compose start node-red`.
+  Node-RED además guarda `.flows.json.backup` (el estado anterior al último Deploy) en la misma carpeta.
+
+### Estado después de una orden (Mongo guarda 1 documento por minuto)
+
+Las consultas de estado siguen leyendo Mongo. Como `telemetria` recibe como
+máximo un documento por minuto, una orden recién confirmada por Node-RED puede
+ser más nueva que el último documento. Mientras eso pase, `telemetria.py`
+muestra el estado de esa válvula/bomba según la orden y lo dice ("Por tu orden
+confirmada hace N segundos… lo guardado en la base todavía es anterior"). En
+cuanto entra un documento posterior a la orden, Mongo vuelve a mandar; si no
+entra ninguno, la orden caduca a los 120 s (`ORDEN_VIGENCIA_S`). Solo cuenta lo
+que Node-RED respondió `confirmado`. La edad se da en segundos si es menor a
+minuto y medio, y toda respuesta de estado avisa que se guarda un dato por
+minuto. Lo que NO cubre: un cambio hecho a mano o desde el dashboard dentro del
+último minuto; el aviso lo menciona. La memoria de órdenes vive en el proceso
+del bot (si reinicia, se responde solo con Mongo).
+
+### Eventos de válvula (colección `eventos`)
+
+Para que el bot también vea los cambios que no hizo él (dashboard, llave a
+mano) sin subir la frecuencia de `telemetria`, Node-RED escribe un evento en
+`eventos` en cuanto una válvula cambia: `{timestamp, tipo: "valvula_abierta"|
+"valvula_cerrada", zona}`. La bomba ya la cubre `detectar_cambio_riego`
+(`riego_on`/`riego_off`). El bot lee los eventos posteriores al último
+documento y los superpone igual que una orden confirmada ("Según el último
+cambio registrado hace N segundos…"). `telemetria` no se toca, así que la LSTM
+no cambia; `_calcular_tiempo_riego` solo mira `riego_on/off` y ignora los tipos
+nuevos. Código del nodo: `otros/nodered-detectar-cambio-valvulas.js`.
+
+Paso a paso en http://localhost:1880/ (flujo "datos"):
+1. Arrastra un nodo **function**, nómbralo `detectar_cambio_valvulas`, pega el
+   contenido de `otros/nodered-detectar-cambio-valvulas.js`, Done.
+2. Cablea la **salida del nodo `datos`** a la entrada del nuevo nodo (la misma
+   salida que ya va a `detectar_cambio_riego` y al delay).
+3. Cablea la salida del nuevo nodo a la entrada de **`envolver payload eventos`**
+   (el mismo nodo al que ya llega `detectar_cambio_riego`).
+4. Deploy. La primera lectura tras cada reinicio de Node-RED solo fija la
+   referencia; no genera evento.
+
 ## Siguiente paso natural
 
 El bot ya narra el estado *actual* del huerto (última lectura de `telemetria`).

@@ -14,7 +14,6 @@ todo lo demás sigue yendo al LLM (ver docstring de
 resolver_consulta_determinista para el detalle de qué queda fuera).
 """
 import re
-from datetime import datetime, timezone
 
 import config
 import telemetria
@@ -71,11 +70,6 @@ def _formatear_zona(doc: dict, zona: int) -> str:
     fuente de datos que format_telemetry_for_llm, pero sin mezclar las
     otras dos zonas en la respuesta.
     """
-    ts = doc["timestamp"]
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    minutos = int((datetime.now(timezone.utc) - ts).total_seconds() // 60)
-
     humedad = doc.get(f"zona{zona}_humedad")
     valvula = doc.get(f"valvula{zona}")
     can_online = doc.get(f"can{zona}_online")
@@ -83,10 +77,13 @@ def _formatear_zona(doc: dict, zona: int) -> str:
     valvula_txt = "abierta" if valvula == 1 else "cerrada"
     can_txt = "en línea" if can_online == 1 else "sin conexión"
 
-    return (
-        f"Hace {minutos} minutos: zona {zona} humedad {humedad}%, "
+    partes = [
+        f"{telemetria.edad_texto(doc['timestamp'])}: zona {zona} humedad {humedad}%, "
         f"válvula {valvula_txt}, conexión CAN: {can_txt}."
-    )
+    ]
+    partes.extend(telemetria.notas_ordenes(doc, campos={f"valvula{zona}"}))
+    partes.append(telemetria.AVISO_GUARDADO)
+    return " ".join(partes)
 
 
 def resolver_consulta_determinista(user_text: str) -> str | None:
